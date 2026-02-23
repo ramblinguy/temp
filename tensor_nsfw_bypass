@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Tensor.Art - NSFW Bypass (via TensorHub)
 // @namespace    tensor-nsfw-bypass
-// @version      3.2
+// @version      3.3
 // @description  Routes generation requests through tensorhub.art API, bypassing NSFW prompt filter while using tensor.art credits
 // @author       You
 // @match        https://tensor.art/*
@@ -22,12 +22,12 @@
     const TENSORHUB_TASK_URL = 'https://api.tensorhub.art/works/v1/works/task';
 
     // ══════════════════════════════════════════════════════════════
-    //  Toggle state — bypass is OFF by default, user turns it ON
+    //  Always-on — no toggle needed
     // ══════════════════════════════════════════════════════════════
-    let bypassEnabled = false;
+    let bypassEnabled = true;
 
     // ══════════════════════════════════════════════════════════════
-    //  Fetch interception — MINIMAL, no DOM changes, no observers
+    //  Fetch interception
     // ══════════════════════════════════════════════════════════════
     W.fetch = function (input, init) {
         const url = typeof input === 'string' ? input : input?.url || '';
@@ -40,26 +40,23 @@
             return _realFetch(input, init).then(async (response) => {
                 try {
                     const data = await response.clone().json();
-                    // Patch only the sensitive word fields, keep everything else
                     if (data.data) {
                         data.data.hasSensitiveWord = false;
                         data.data.sensitiveWords = [];
                     }
-                    console.log('[NSFW-Bypass] ✓ Patched sensitive check → clean');
                     return new Response(JSON.stringify(data), {
                         status: response.status,
                         statusText: response.statusText,
                         headers: { 'Content-Type': 'application/json' }
                     });
                 } catch (e) {
-                    return response; // if parsing fails, return original
+                    return response;
                 }
             });
         }
 
         // ── Redirect generation request to tensorhub ──
         // EXACT match: only /works/v1/works/task (end of path)
-        // NOT /task/calculate_credits, NOT /tasks/query, etc.
         if (/\/works\/v1\/works\/task(\?|$)/.test(url) &&
             init?.method?.toUpperCase() === 'POST') {
             let bodyObj;
@@ -123,67 +120,14 @@
     }
 
     // ══════════════════════════════════════════════════════════════
-    //  Toggle button — created ONCE, no observers, no intervals
-    // ══════════════════════════════════════════════════════════════
-    function createToggle() {
-        if (document.getElementById('nsfw-toggle')) return;
-
-        const btn = document.createElement('div');
-        btn.id = 'nsfw-toggle';
-        btn.style.cssText = `
-            position:fixed;bottom:14px;left:14px;z-index:99998;
-            padding:6px 14px;border-radius:20px;font-size:12px;font-weight:700;
-            font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
-            cursor:pointer;user-select:none;box-shadow:0 2px 10px rgba(0,0,0,0.4);
-            transition:all 0.2s;
-        `;
-        updateToggleUI(btn);
-
-        btn.onclick = () => {
-            bypassEnabled = !bypassEnabled;
-            updateToggleUI(btn);
-            console.log('[NSFW-Bypass]', bypassEnabled ? 'ON — next Generate will bypass' : 'OFF');
-        };
-
-        document.body.appendChild(btn);
-    }
-
-    function updateToggleUI(btn) {
-        if (!btn) btn = document.getElementById('nsfw-toggle');
-        if (!btn) return;
-        if (bypassEnabled) {
-            btn.style.background = '#1a3d1a';
-            btn.style.color = '#4eff4e';
-            btn.style.border = '1px solid #2a6a2a';
-            btn.textContent = '🔓 NSFW ON';
-            btn.title = 'Click to disable NSFW bypass';
-        } else {
-            btn.style.background = '#2a2a2a';
-            btn.style.color = '#888';
-            btn.style.border = '1px solid #444';
-            btn.textContent = '🔒 NSFW OFF';
-            btn.title = 'Click to enable NSFW bypass';
-        }
-    }
-
-    // Create toggle when DOM is ready — NO MutationObserver, NO setInterval
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', createToggle);
-    } else {
-        createToggle();
-    }
-
-    // Single delayed check for SPA navigation (runs once after 2s, not repeating)
-    setTimeout(() => { if (!document.getElementById('nsfw-toggle')) createToggle(); }, 2000);
-
-    // ══════════════════════════════════════════════════════════════
     //  Console API
     // ══════════════════════════════════════════════════════════════
     W.NSFWBypass = {
-        on: () => { bypassEnabled = true; updateToggleUI(); console.log('[NSFW-Bypass] ON'); },
-        off: () => { bypassEnabled = false; updateToggleUI(); console.log('[NSFW-Bypass] OFF'); },
+        on: () => { bypassEnabled = true; console.log('[NSFW-Bypass] ON'); },
+        off: () => { bypassEnabled = false; console.log('[NSFW-Bypass] OFF'); },
         status: () => ({ enabled: bypassEnabled }),
     };
 
-    console.log('[NSFW-Bypass v3] ✓ Ready. Click the 🔒 button (bottom-left) to toggle.');
+    console.log('[NSFW-Bypass v3] ✓ Active. All generations routed through tensorhub.');
 })();
+
