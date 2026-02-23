@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Tensor.Art - Show TensorHub Images
 // @namespace    tensor-hub-merge
-// @version      1.0
+// @version      1.1
 // @description  Fetches generation tasks from tensorhub.art and merges them into tensor.art's task list so they appear in your history
 // @author       You
 // @match        https://tensor.art/*

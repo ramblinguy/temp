@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Tensor.Art - NSFW Bypass (via TensorHub)
 // @namespace    tensor-nsfw-bypass
-// @version      2.0
+// @version      2.2
 // @description  Routes generation requests through tensorhub.art API, bypassing NSFW prompt filter while using tensor.art credits
 // @author       You
 // @match        https://tensor.art/*
