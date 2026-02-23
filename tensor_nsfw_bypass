@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Tensor.Art - NSFW Bypass (via TensorHub)
 // @namespace    tensor-nsfw-bypass
-// @version      2.2
+// @version      3.0
 // @description  Routes generation requests through tensorhub.art API, bypassing NSFW prompt filter while using tensor.art credits
 // @author       You
 // @match        https://tensor.art/*
@@ -18,119 +18,41 @@
 
     const W = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
     const _realFetch = W.fetch.bind(W);
-
     const BLOCKED_HEADERS = ['priority', 'sec-ch-ua', 'sec-ch-ua-mobile', 'sec-ch-ua-platform'];
-    const TASK_ENDPOINT = '/works/v1/works/task';
-    const SENSITIVE_CHECK = '/sensitive/words/check';
     const TENSORHUB_TASK_URL = 'https://api.tensorhub.art/works/v1/works/task';
 
     // ══════════════════════════════════════════════════════════════
-    //  Persistent header storage (shared with tensorhub script)
+    //  Toggle state — bypass is OFF by default, user turns it ON
     // ══════════════════════════════════════════════════════════════
-    let savedHeaders = GM_getValue('tensorHeaders', null);
-    let savedAt = GM_getValue('tensorHeadersAt', 0);
-
-    function saveHeaders(h) {
-        savedHeaders = h;
-        savedAt = Date.now();
-        GM_setValue('tensorHeaders', h);
-        GM_setValue('tensorHeadersAt', savedAt);
-        updateStatusUI();
-    }
-
-    function headerAge() {
-        return savedHeaders ? Math.round((Date.now() - savedAt) / 1000) : -1;
-    }
-
-    console.log('[NSFW-Bypass] Initializing...');
-    if (savedHeaders) {
-        console.log('[NSFW-Bypass] ✓ Restored saved headers (age: ' + headerAge() + 's)');
-    }
+    let bypassEnabled = false;
 
     // ══════════════════════════════════════════════════════════════
-    //  Intercept fetch
+    //  Fetch interception — MINIMAL, no DOM changes, no observers
     // ══════════════════════════════════════════════════════════════
-
-    // Only fake the sensitive check within a short window after clicking Generate
-    let generateClicked = 0;
-    const GENERATE_WINDOW = 3000; // 3 seconds
-
-    // Find and attach listener to the Generate button specifically
-    function hookGenerateButton() {
-        // Already hooked?
-        if (document.querySelector('[data-nsfw-hooked]')) return;
-
-        // Look for buttons containing "Generate" text
-        const buttons = document.querySelectorAll('button');
-        for (const btn of buttons) {
-            const text = btn.textContent?.trim();
-            if (text && /^Generate$/i.test(text)) {
-                btn.setAttribute('data-nsfw-hooked', '1');
-                btn.addEventListener('click', () => {
-                    generateClicked = Date.now();
-                    console.log('[NSFW-Bypass] Generate button clicked — bypass armed for 3s');
-                }, true); // capture phase, fires before tensor.art's handler
-                console.log('[NSFW-Bypass] ✓ Hooked Generate button');
-                return;
-            }
-        }
-    }
-
-    // Keep trying to hook (SPA navigation may recreate the button)
-    function startButtonHook() {
-        hookGenerateButton();
-        const observer = new MutationObserver(() => hookGenerateButton());
-        observer.observe(document.body, { childList: true, subtree: true });
-        setInterval(hookGenerateButton, 3000);
-    }
-
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', startButtonHook);
-    } else {
-        startButtonHook();
-    }
-
     W.fetch = function (input, init) {
         const url = typeof input === 'string' ? input : input?.url || '';
 
-        // ── Capture headers from every api.tensor.art call ──
-        if (url.includes('api.tensor.art') && init?.headers) {
-            const h = {};
-            if (init.headers instanceof W.Headers) {
-                init.headers.forEach((v, k) => { h[k] = v; });
-            } else if (typeof init.headers === 'object') {
-                Object.assign(h, init.headers);
-            }
-            if (h['Authorization'] || h['authorization']) {
-                saveHeaders(h);
-            }
+        // Only intercept when bypass is enabled
+        if (!bypassEnabled) return _realFetch(input, init);
+
+        // ── Bypass sensitive word check ──
+        if (url.includes('/sensitive/words/check')) {
+            console.log('[NSFW-Bypass] ✓ Bypassed sensitive word check');
+            return Promise.resolve(new Response(JSON.stringify({
+                code: '0000',
+                data: { hasSensitiveWord: false, sensitiveWords: [] },
+                message: ''
+            }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
         }
 
-        // ── Bypass: fake the sensitive word check ONLY if user recently interacted ──
-        if (url.includes(SENSITIVE_CHECK)) {
-            const recentGenerate = (Date.now() - generateClicked) < GENERATE_WINDOW;
-            if (recentGenerate) {
-                console.log('[NSFW-Bypass] ✓ Bypassed sensitive word check (Generate clicked)');
-                return Promise.resolve(new Response(JSON.stringify({
-                    code: '0000',
-                    data: { hasSensitiveWord: false, sensitiveWords: [] },
-                    message: ''
-                }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
-            } else {
-                console.log('[NSFW-Bypass] Sensitive check on page load — passing through to real API');
-                return _realFetch(input, init);
-            }
-        }
-
-        // ── Redirect generation requests → tensorhub ──
-        if (url.includes(TASK_ENDPOINT) && !url.includes('tasks/query') &&
+        // ── Redirect generation request to tensorhub ──
+        if (url.includes('/works/v1/works/task') && !url.includes('tasks/') &&
             init?.method?.toUpperCase() === 'POST') {
             let bodyObj;
             try { bodyObj = JSON.parse(init.body); } catch (e) { return _realFetch(input, init); }
-
             if (!bodyObj?.params?.prompt) return _realFetch(input, init);
 
-            console.log('[NSFW-Bypass] ✓ Intercepted generation → routing to tensorhub');
+            console.log('[NSFW-Bypass] ✓ Redirecting generation to tensorhub');
             return redirectToHub(init, init.body);
         }
 
@@ -138,7 +60,7 @@
     };
 
     // ══════════════════════════════════════════════════════════════
-    //  Redirect to tensorhub.art API via GM_xmlhttpRequest
+    //  Redirect to tensorhub
     // ══════════════════════════════════════════════════════════════
     function redirectToHub(init, bodyStr) {
         const reqHeaders = {};
@@ -156,10 +78,6 @@
         headers['X-Request-Package-Id'] = '3003';
         headers['Content-Type'] = 'application/json';
 
-        // Also save these task-specific headers for the tensorhub script
-        GM_setValue('tensorTaskHeaders', reqHeaders);
-        GM_setValue('tensorTaskHeadersAt', Date.now());
-
         return new Promise((resolve) => {
             GM_xmlhttpRequest({
                 method: 'POST',
@@ -174,89 +92,84 @@
                         } else {
                             console.warn('[NSFW-Bypass] ⚠️ Error:', data.code, data.msg || data.message);
                         }
-                    } catch (e) { /* pass through raw */ }
+                    } catch (e) { /* pass raw */ }
                     resolve(new Response(resp.responseText, {
                         status: 200,
                         headers: { 'Content-Type': 'application/json' }
                     }));
                 },
                 onerror: function (err) {
-                    console.error('[NSFW-Bypass] ❌ Request failed:', err);
-                    resolve(new Response(JSON.stringify({
-                        code: 'BYPASS_ERROR',
-                        msg: 'Bypass request failed. Try refreshing the page.'
-                    }), { status: 500, headers: { 'Content-Type': 'application/json' } }));
+                    console.error('[NSFW-Bypass] ❌ Failed:', err);
+                    resolve(new Response(JSON.stringify({ code: 'ERROR', msg: 'Bypass failed' }), {
+                        status: 500, headers: { 'Content-Type': 'application/json' }
+                    }));
                 }
             });
         });
     }
 
     // ══════════════════════════════════════════════════════════════
-    //  Status badge UI
+    //  Toggle button — created ONCE, no observers, no intervals
     // ══════════════════════════════════════════════════════════════
-    function updateStatusUI() {
-        let badge = document.getElementById('nsfw-status');
-        if (!badge) return; // will be created when DOM is ready
-        const age = headerAge();
-        const valid = savedHeaders && age < 1800; // 30 min
-        badge.style.background = valid ? '#0a3d0a' : '#3d0a0a';
-        badge.style.color = valid ? '#4eff4e' : '#ff4e4e';
-        badge.textContent = valid
-            ? `🔓 NSFW ON (${age}s ago)`
-            : '🔒 No headers — generate any image';
-    }
+    function createToggle() {
+        if (document.getElementById('nsfw-toggle')) return;
 
-    function createUI() {
-        // Floating badge — bottom-left so it doesn't conflict with the viewer panel
-        const badge = document.createElement('div');
-        badge.id = 'nsfw-status';
-        badge.style.cssText = `
+        const btn = document.createElement('div');
+        btn.id = 'nsfw-toggle';
+        btn.style.cssText = `
             position:fixed;bottom:14px;left:14px;z-index:99998;
-            padding:6px 12px;border-radius:20px;font-size:11px;font-weight:600;
+            padding:6px 14px;border-radius:20px;font-size:12px;font-weight:700;
             font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
             cursor:pointer;user-select:none;box-shadow:0 2px 10px rgba(0,0,0,0.4);
-            border:1px solid #2a2a4a;transition:opacity 0.2s;
+            transition:all 0.2s;
         `;
-        badge.title = 'Click to refresh header status';
-        badge.onclick = () => {
-            updateStatusUI();
-            console.log('[NSFW-Bypass] Headers saved:', !!savedHeaders, '| Age:', headerAge() + 's');
+        updateToggleUI(btn);
+
+        btn.onclick = () => {
+            bypassEnabled = !bypassEnabled;
+            updateToggleUI(btn);
+            console.log('[NSFW-Bypass]', bypassEnabled ? 'ON — next Generate will bypass' : 'OFF');
         };
-        document.body.appendChild(badge);
-        updateStatusUI();
+
+        document.body.appendChild(btn);
     }
 
+    function updateToggleUI(btn) {
+        if (!btn) btn = document.getElementById('nsfw-toggle');
+        if (!btn) return;
+        if (bypassEnabled) {
+            btn.style.background = '#1a3d1a';
+            btn.style.color = '#4eff4e';
+            btn.style.border = '1px solid #2a6a2a';
+            btn.textContent = '🔓 NSFW ON';
+            btn.title = 'Click to disable NSFW bypass';
+        } else {
+            btn.style.background = '#2a2a2a';
+            btn.style.color = '#888';
+            btn.style.border = '1px solid #444';
+            btn.textContent = '🔒 NSFW OFF';
+            btn.title = 'Click to enable NSFW bypass';
+        }
+    }
+
+    // Create toggle when DOM is ready — NO MutationObserver, NO setInterval
     if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', createUI);
+        document.addEventListener('DOMContentLoaded', createToggle);
     } else {
-        createUI();
+        createToggle();
     }
 
-    // Re-create UI if lost (SPA navigation)
-    setInterval(() => {
-        if (!document.getElementById('nsfw-status')) createUI();
-    }, 5000);
+    // Single delayed check for SPA navigation (runs once after 2s, not repeating)
+    setTimeout(() => { if (!document.getElementById('nsfw-toggle')) createToggle(); }, 2000);
 
     // ══════════════════════════════════════════════════════════════
     //  Console API
     // ══════════════════════════════════════════════════════════════
     W.NSFWBypass = {
-        status: () => ({
-            hasHeaders: !!savedHeaders,
-            age: headerAge() + 's',
-            savedAt: new Date(savedAt).toLocaleTimeString(),
-        }),
-        clearHeaders: () => {
-            savedHeaders = null;
-            savedAt = 0;
-            GM_setValue('tensorHeaders', null);
-            GM_setValue('tensorHeadersAt', 0);
-            GM_setValue('tensorTaskHeaders', null);
-            GM_setValue('tensorTaskHeadersAt', 0);
-            updateStatusUI();
-            console.log('[NSFW-Bypass] Headers cleared.');
-        },
+        on: () => { bypassEnabled = true; updateToggleUI(); console.log('[NSFW-Bypass] ON'); },
+        off: () => { bypassEnabled = false; updateToggleUI(); console.log('[NSFW-Bypass] OFF'); },
+        status: () => ({ enabled: bypassEnabled }),
     };
 
-    console.log('[NSFW-Bypass] ✓ Ready — just type any prompt and click Generate.');
+    console.log('[NSFW-Bypass v3] ✓ Ready. Click the 🔒 button (bottom-left) to toggle.');
 })();
