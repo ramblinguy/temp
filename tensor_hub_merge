@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Tensor.Art - Show TensorHub Images
 // @namespace    tensor-hub-merge
-// @version      1.1
+// @version      1.2
 // @description  Fetches generation tasks from tensorhub.art and merges them into tensor.art's task list so they appear in your history
 // @author       You
 // @match        https://tensor.art/*
@@ -19,9 +19,6 @@
     const BLOCKED_HEADERS = ['priority', 'sec-ch-ua', 'sec-ch-ua-mobile', 'sec-ch-ua-platform'];
 
     let capturedHeaders = null;
-    let hasMergedThisSession = false; // Only merge once per page load
-    let lastMergeTime = 0;
-    const MERGE_COOLDOWN = 10000; // 10 seconds between merges
 
     console.log('[HubMerge] Initializing — will merge tensorhub tasks into tensor.art...');
 
@@ -45,9 +42,7 @@
         }
 
         // Intercept tasks/query responses to merge in tensorhub tasks
-        // Only merge ONCE per session to avoid cascading extra requests
-        if (url.includes('/works/v1/works/tasks/query') && url.includes('api.tensor.art') &&
-            !hasMergedThisSession && (Date.now() - lastMergeTime) > MERGE_COOLDOWN) {
+        if (url.includes('/works/v1/works/tasks/query') && url.includes('api.tensor.art')) {
             const bodyStr = init?.body;
 
             return _realFetch(input, init).then(async (response) => {
@@ -55,14 +50,12 @@
                     const cloned = response.clone();
                     const tensorData = await cloned.json();
 
-                    // Fetch tensorhub tasks
+                    // Fetch tensorhub tasks in parallel
                     const hubTasks = await fetchHubTasks(bodyStr);
 
                     if (hubTasks && hubTasks.length > 0) {
                         const merged = mergeTaskData(tensorData, hubTasks);
-                        console.log(`[HubMerge] ✓ Merged ${hubTasks.length} tensorhub tasks (one-time)`);
-                        hasMergedThisSession = true;
-                        lastMergeTime = Date.now();
+                        console.log(`[HubMerge] ✓ Merged ${hubTasks.length} tensorhub tasks`);
 
                         return new Response(JSON.stringify(merged), {
                             status: response.status,
@@ -215,15 +208,8 @@
     W.HubMerge = {
         status: () => ({
             hasHeaders: !!capturedHeaders,
-            merged: hasMergedThisSession,
-            message: capturedHeaders ? 'Ready — hub tasks merged on first query' : 'Waiting for headers...'
+            message: capturedHeaders ? 'Ready — hub tasks will be merged on next page load' : 'Waiting for headers...'
         }),
-        /** Re-enable merging (e.g., to pick up newly generated hub tasks) */
-        refresh: () => {
-            hasMergedThisSession = false;
-            lastMergeTime = 0;
-            console.log('[HubMerge] Merge re-enabled — will run on next tasks/query call.');
-        },
     };
 
     console.log('[HubMerge] ✓ Ready. TensorHub tasks will automatically appear in your generation history.');
