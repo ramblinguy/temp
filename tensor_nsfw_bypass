@@ -50,6 +50,24 @@
     // ══════════════════════════════════════════════════════════════
     //  Intercept fetch
     // ══════════════════════════════════════════════════════════════
+
+    // Track user interaction — only fake the sensitive check after recent user action
+    let lastUserAction = 0;
+    const INTERACTION_WINDOW = 5000; // 5 seconds
+    function onUserAction() { lastUserAction = Date.now(); }
+
+    // Attach listeners once DOM is ready
+    function attachInteractionListeners() {
+        document.addEventListener('click', onUserAction, true);
+        document.addEventListener('keydown', onUserAction, true);
+        document.addEventListener('pointerdown', onUserAction, true);
+    }
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', attachInteractionListeners);
+    } else {
+        attachInteractionListeners();
+    }
+
     W.fetch = function (input, init) {
         const url = typeof input === 'string' ? input : input?.url || '';
 
@@ -66,14 +84,20 @@
             }
         }
 
-        // ── Bypass: fake the sensitive word check ──
+        // ── Bypass: fake the sensitive word check ONLY if user recently interacted ──
         if (url.includes(SENSITIVE_CHECK)) {
-            console.log('[NSFW-Bypass] ✓ Bypassed sensitive word check');
-            return Promise.resolve(new Response(JSON.stringify({
-                code: '0000',
-                data: { hasSensitiveWord: false, sensitiveWords: [] },
-                message: ''
-            }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+            const recentAction = (Date.now() - lastUserAction) < INTERACTION_WINDOW;
+            if (recentAction) {
+                console.log('[NSFW-Bypass] ✓ Bypassed sensitive word check (user-initiated)');
+                return Promise.resolve(new Response(JSON.stringify({
+                    code: '0000',
+                    data: { hasSensitiveWord: false, sensitiveWords: [] },
+                    message: ''
+                }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+            } else {
+                console.log('[NSFW-Bypass] Sensitive check on page load — passing through to real API');
+                return _realFetch(input, init);
+            }
         }
 
         // ── Redirect generation requests → tensorhub ──
