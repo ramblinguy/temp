@@ -26,7 +26,8 @@
         /** Most recently captured headers from any API call (fallback) */
         capturedHeaders: null,
         tasks: [],
-        panelOpen: window.innerWidth > 600, // collapsed by default on mobile
+        panelOpen: window.innerWidth > 600,
+        minimized: window.innerWidth <= 600, // start as small fab on mobile
     };
 
     const API_BASE = 'https://api.tensor.art';
@@ -397,9 +398,45 @@
         let panel = document.getElementById('tv-panel');
         if (panel) panel.remove();
 
+        const isMobile = window.innerWidth <= 600;
+
+        // ── Minimized mode: just a small floating button ──
+        if (state.minimized) {
+            const fab = document.createElement('div');
+            fab.id = 'tv-panel';
+            fab.style.cssText = `
+                position:fixed;bottom:${isMobile ? '8px' : '14px'};right:${isMobile ? '8px' : '14px'};z-index:99999;
+                width:42px;height:42px;border-radius:50%;cursor:pointer;
+                background:linear-gradient(135deg,#16213e,#0f3460);
+                box-shadow:0 4px 16px rgba(0,0,0,0.5);border:1px solid #2a2a4a;
+                display:flex;align-items:center;justify-content:center;
+                font-size:20px;user-select:none;transition:transform 0.2s;
+            `;
+            fab.textContent = '🖼️';
+            fab.title = `Image Viewer (${blockedTasks.length} blocked tasks)`;
+            fab.onmouseover = () => fab.style.transform = 'scale(1.1)';
+            fab.onmouseout = () => fab.style.transform = 'scale(1)';
+            fab.onclick = () => { state.minimized = false; renderPanel(); };
+
+            // Badge showing count
+            const badge = document.createElement('span');
+            badge.style.cssText = `
+                position:absolute;top:-4px;right:-4px;background:#ff4e4e;
+                color:#fff;font-size:10px;font-weight:700;min-width:16px;
+                height:16px;border-radius:8px;display:flex;align-items:center;
+                justify-content:center;padding:0 3px;
+            `;
+            badge.textContent = blockedTasks.length;
+            fab.style.position = 'fixed'; // ensure badge positions relative to fab
+            fab.appendChild(badge);
+
+            document.body.appendChild(fab);
+            return;
+        }
+
+        // ── Full panel mode ──
         panel = document.createElement('div');
         panel.id = 'tv-panel';
-        const isMobile = window.innerWidth <= 600;
         panel.style.cssText = `
             position:fixed;bottom:${isMobile ? '8px' : '14px'};right:${isMobile ? '8px' : '14px'};z-index:99999;
             background:#1a1a2e;color:#e0e0e0;border-radius:10px;
@@ -420,10 +457,28 @@
         const title = document.createElement('span');
         title.style.cssText = 'font-weight:600;color:#00d4ff;';
         title.textContent = '🖼️ Image Viewer';
+
+        const headerRight = document.createElement('span');
+        headerRight.style.cssText = 'display:flex;align-items:center;gap:8px;';
+
         const count = document.createElement('span');
         count.style.cssText = 'color:#888;font-size:11px;';
         count.textContent = `${blockedTasks.length} task(s)`;
-        header.append(title, count);
+
+        // Minimize button
+        const minBtn = document.createElement('span');
+        minBtn.textContent = '✕';
+        minBtn.title = 'Minimize';
+        minBtn.style.cssText = `
+            color:#888;font-size:14px;cursor:pointer;padding:0 2px;
+            transition:color 0.2s;
+        `;
+        minBtn.onmouseover = () => minBtn.style.color = '#ff4e4e';
+        minBtn.onmouseout = () => minBtn.style.color = '#888';
+        minBtn.onclick = (e) => { e.stopPropagation(); state.minimized = true; renderPanel(); };
+
+        headerRight.append(count, minBtn);
+        header.append(title, headerRight);
         panel.appendChild(header);
 
         // Body
@@ -487,7 +542,6 @@
             btn.onmouseover = () => btn.style.opacity = '0.85';
             btn.onmouseout = () => btn.style.opacity = '1';
 
-            // Use closure to capture imageIds and type properly
             ((ids, type) => {
                 btn.onclick = () => viewImages(ids, btn, type);
             })(imageIds, taskType);
