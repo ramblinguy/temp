@@ -1,0 +1,543 @@
+// ==UserScript==
+// @name         Tensor.Art - View Inappropriate Images
+// @namespace    http://tampermonkey.net/
+// @version      2.0
+// @description  Adds "View Original" buttons to inappropriate image cards on tensor.art
+// @author       You
+// @match        https://tensor.art/*
+// @grant        unsafeWindow
+// @grant        GM_xmlhttpRequest
+// @connect      api.tensor.art
+// @run-at       document-start
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // Use unsafeWindow to patch the REAL page context (not Tampermonkey's sandbox)
+    const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+
+    // ══════════════════════════════════════════════════════════════
+    //  State
+    // ══════════════════════════════════════════════════════════════
+    const state = {
+        /** Headers stored per API path — key is the endpoint path */
+        headersByPath: {},
+        /** Most recently captured headers from any API call (fallback) */
+        capturedHeaders: null,
+        tasks: [],
+        panelOpen: true,
+    };
+
+    const API_BASE = 'https://api.tensor.art';
+    const ORIGIN_LIST_PATH = '/works/v1/generation/image/origin/list';
+    const ORIGIN_LIST_URL = `${API_BASE}${ORIGIN_LIST_PATH}`;
+    const VIDEO_ORIGIN_PATH = '/works/v1/generation/video/origin/list';
+    const VIDEO_ORIGIN_URL = `${API_BASE}${VIDEO_ORIGIN_PATH}`;
+    const BLOCKED_HEADERS = ['priority', 'sec-ch-ua', 'sec-ch-ua-mobile', 'sec-ch-ua-platform'];
+
+    /** Extract API path from a full URL */
+    function getApiPath(url) {
+        try {
+            const u = new URL(url);
+            return u.pathname;
+        } catch {
+            // Relative URL or parsing failure
+            const match = url.match(/\/works\/[^?#]+/);
+            return match ? match[0] : null;
+        }
+    }
+
+    console.log('[TensorViewer v2] Initializing...');
+
+    // ══════════════════════════════════════════════════════════════
+    //  1. Intercept fetch on the REAL window
+    // ══════════════════════════════════════════════════════════════
+    const _realFetch = W.fetch.bind(W);
+
+    W.fetch = function (input, init) {
+        const url = typeof input === 'string' ? input : input?.url || '';
+
+        // Capture headers from any API call, keyed by path
+        if (url.includes('api.tensor.art') && init?.headers) {
+            const h = {};
+            if (init.headers instanceof W.Headers) {
+                init.headers.forEach((v, k) => { h[k] = v; });
+            } else if (typeof init.headers === 'object') {
+                Object.assign(h, init.headers);
+            }
+            state.capturedHeaders = h;
+            const path = getApiPath(url);
+            if (path) {
+                state.headersByPath[path] = h;
+                console.log('[TensorViewer v2] ✓ Captured headers for', path);
+            }
+            // Re-render panel status when we capture origin/list headers
+            if (path === ORIGIN_LIST_PATH) scheduleRender();
+        }
+
+        const result = _realFetch(input, init);
+
+        // Intercept tasks/query responses
+        if (url.includes('tasks/query')) {
+            result.then(r => r.clone().json())
+                .then(json => {
+                    handleTasksResponse(json);
+                })
+                .catch(e => console.warn('[TensorViewer v2] tasks/query parse error:', e));
+        }
+
+        return result;
+    };
+
+    // ══════════════════════════════════════════════════════════════
+    //  2. Also intercept XMLHttpRequest on the REAL window
+    // ══════════════════════════════════════════════════════════════
+    const _xhrOpen = W.XMLHttpRequest.prototype.open;
+    const _xhrSend = W.XMLHttpRequest.prototype.send;
+    const _xhrSetHeader = W.XMLHttpRequest.prototype.setRequestHeader;
+
+    W.XMLHttpRequest.prototype.open = function (method, url) {
+        this.__tv_url = url;
+        this.__tv_headers = {};
+        return _xhrOpen.apply(this, arguments);
+    };
+
+    W.XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
+        if (this.__tv_headers) this.__tv_headers[name] = value;
+        return _xhrSetHeader.apply(this, arguments);
+    };
+
+    W.XMLHttpRequest.prototype.send = function (body) {
+        if (this.__tv_url && this.__tv_url.includes('api.tensor.art')) {
+            state.capturedHeaders = { ...this.__tv_headers };
+            const path = getApiPath(this.__tv_url);
+            if (path) {
+                state.headersByPath[path] = { ...this.__tv_headers };
+                console.log('[TensorViewer v2] ✓ Captured headers (XHR) for', path);
+            }
+            if (path === ORIGIN_LIST_PATH) scheduleRender();
+
+            if (this.__tv_url.includes('tasks/query')) {
+                this.addEventListener('load', function () {
+                    try {
+                        handleTasksResponse(JSON.parse(this.responseText));
+                    } catch (_) { }
+                });
+            }
+        }
+        return _xhrSend.apply(this, arguments);
+    };
+
+    // ══════════════════════════════════════════════════════════════
+    //  3. Process tasks/query response
+    // ══════════════════════════════════════════════════════════════
+    function handleTasksResponse(json) {
+        // Try multiple possible response structures
+        const list = json?.data?.list || json?.data?.tasks || json?.list || json?.tasks || [];
+        if (!list.length) {
+            console.log('[TensorViewer v2] tasks/query response had no tasks. Keys:', Object.keys(json?.data || json || {}));
+            return;
+        }
+
+        state.tasks = list;
+        console.log(`[TensorViewer v2] ✓ Captured ${list.length} tasks`);
+
+        // Log task details for debugging
+        list.forEach(t => {
+            const items = t.items || t.subItems || [];
+            const invalidCount = items.filter(i => i.invalid).length;
+            const taskType = detectTaskType(t);
+            if (invalidCount > 0) {
+                const ids = items.map(i => i.imageId || i.workId || i.id).filter(Boolean);
+                console.log(`[TensorViewer v2]   Task ${(t.taskId || t.id || '?').substring(0, 12)}... [${taskType}] — ${invalidCount}/${items.length} blocked — IDs: ${ids.join(', ')}`);
+            }
+        });
+
+        scheduleRender();
+    }
+
+    /** Detect whether a task is image or video based on its data */
+    function detectTaskType(task) {
+        // Check explicit type fields
+        const type = (task.type || task.taskType || task.generationType || '').toLowerCase();
+        if (type.includes('video')) return 'video';
+        if (type.includes('image') || type.includes('img')) return 'image';
+
+        // Check items for video clues
+        const items = task.items || task.subItems || [];
+        for (const item of items) {
+            const url = item.url || item.videoUrl || '';
+            if (url.includes('.mp4') || url.includes('.webm') || url.includes('video')) return 'video';
+            if (item.videoUrl || item.videoId) return 'video';
+        }
+
+        // Check task-level clues
+        if (task.videoUrl || task.video) return 'video';
+
+        return 'image'; // default
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  4. Fetch original images
+    // ══════════════════════════════════════════════════════════════
+    function fetchOriginImages(imageIds, taskType) {
+        // Pick the best available headers — prefer origin/list-specific headers
+        const originHeaders = state.headersByPath[ORIGIN_LIST_PATH];
+        const bestHeaders = originHeaders || state.capturedHeaders;
+
+        if (!bestHeaders) {
+            alert('[TensorViewer] No API headers captured yet.\n\nClick any visible image first to generate API traffic, then try again.');
+            return Promise.resolve(null);
+        }
+
+        const headers = {};
+        for (const [k, v] of Object.entries(bestHeaders)) {
+            if (!BLOCKED_HEADERS.includes(k.toLowerCase())) {
+                headers[k] = v;
+            }
+        }
+        headers['Content-Type'] = 'application/json';
+
+        console.log('[TensorViewer v2] Using headers from:', originHeaders ? 'origin/list (exact match)' : 'fallback (other endpoint)');
+        console.log('[TensorViewer v2] Task type:', taskType || 'image');
+
+        // Determine which endpoint(s) to try
+        const isVideo = taskType === 'video';
+        const primaryUrl = isVideo ? VIDEO_ORIGIN_URL : ORIGIN_LIST_URL;
+        const fallbackUrl = isVideo ? ORIGIN_LIST_URL : VIDEO_ORIGIN_URL;
+
+        // Method 1: Use GM_xmlhttpRequest (bypasses CORS entirely)
+        if (typeof GM_xmlhttpRequest !== 'undefined') {
+            return new Promise((resolve) => {
+                GM_xmlhttpRequest({
+                    method: 'POST',
+                    url: primaryUrl,
+                    headers: headers,
+                    data: JSON.stringify({ ids: imageIds }),
+                    onload: function (resp) {
+                        try {
+                            const data = JSON.parse(resp.responseText);
+                            const urls = data?.data?.urls || data?.data?.imageOriginList?.map(i => i.url);
+                            if (urls && urls.length) {
+                                resolve(data);
+                            } else {
+                                // Try fallback endpoint
+                                console.log('[TensorViewer v2] Primary endpoint returned no URLs, trying fallback...');
+                                GM_xmlhttpRequest({
+                                    method: 'POST',
+                                    url: fallbackUrl,
+                                    headers: headers,
+                                    data: JSON.stringify({ ids: imageIds }),
+                                    onload: function (resp2) {
+                                        try { resolve(JSON.parse(resp2.responseText)); }
+                                        catch (e) { resolve(data); } // Return original response
+                                    },
+                                    onerror: function () { resolve(data); }
+                                });
+                            }
+                        } catch (e) {
+                            console.error('[TensorViewer v2] Parse error:', e);
+                            resolve(null);
+                        }
+                    },
+                    onerror: function (err) {
+                        console.error('[TensorViewer v2] GM_xmlhttpRequest error:', err);
+                        resolve(null);
+                    }
+                });
+            });
+        }
+
+        // Method 2: Fallback to regular fetch with the same headers
+        return _realFetch(primaryUrl, {
+            method: 'POST',
+            headers,
+            credentials: 'include',
+            body: JSON.stringify({ ids: imageIds }),
+        })
+            .then(r => r.json())
+            .catch(err => {
+                console.error('[TensorViewer v2] Fetch error:', err);
+                return null;
+            });
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  5. View images action
+    // ══════════════════════════════════════════════════════════════
+    async function viewImages(imageIds, button, taskType) {
+        const origText = button.textContent;
+        button.textContent = '⏳ Loading...';
+        button.disabled = true;
+
+        const data = await fetchOriginImages(imageIds, taskType);
+
+        // Handle different response shapes
+        let urls = null;
+        if (data?.data?.urls) urls = data.data.urls;
+        else if (data?.data?.imageOriginList) urls = data.data.imageOriginList.map(i => i.url);
+        else if (data?.urls) urls = data.urls;
+
+        if (urls && urls.length) {
+            console.log(`[TensorViewer v2] ✓ Got ${urls.length} URLs (type: ${taskType || 'image'})`);
+            showGallery(urls, taskType);
+            button.textContent = `✅ Loaded ${urls.length} items`;
+            setTimeout(() => { button.textContent = origText; button.disabled = false; }, 3000);
+        } else {
+            button.textContent = '❌ Failed — click a visible image first';
+            button.disabled = false;
+            setTimeout(() => { button.textContent = origText; }, 4000);
+            console.log('[TensorViewer v2] Response:', data);
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  6. Gallery modal
+    // ══════════════════════════════════════════════════════════════
+    function showGallery(urls, taskType) {
+        let existing = document.getElementById('tv-gallery');
+        if (existing) existing.remove();
+
+        const isVideo = taskType === 'video';
+
+        const overlay = document.createElement('div');
+        overlay.id = 'tv-gallery';
+        overlay.style.cssText = `
+            position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,0.93);
+            display:flex;flex-direction:column;align-items:center;justify-content:center;
+            padding:20px;
+        `;
+
+        const close = document.createElement('button');
+        close.textContent = '✕ Close';
+        close.style.cssText = `
+            position:absolute;top:16px;right:24px;background:none;border:1px solid #555;
+            color:#fff;font-size:16px;padding:6px 16px;border-radius:6px;cursor:pointer;z-index:100001;
+        `;
+        close.onclick = () => overlay.remove();
+        overlay.appendChild(close);
+
+        const grid = document.createElement('div');
+        grid.style.cssText = `
+            display:grid;grid-template-columns:repeat(${isVideo ? 1 : 2},1fr);gap:12px;
+            max-width:90vw;max-height:85vh;overflow:auto;padding:10px;
+        `;
+
+        urls.forEach((url, i) => {
+            const wrap = document.createElement('div');
+            wrap.style.cssText = 'text-align:center;';
+
+            const isVidUrl = isVideo || url.includes('.mp4') || url.includes('.webm') || url.includes('video');
+
+            let media;
+            if (isVidUrl) {
+                media = document.createElement('video');
+                media.src = url;
+                media.controls = true;
+                media.loop = true;
+                media.style.cssText = `
+                    max-width:100%;max-height:70vh;border-radius:8px;object-fit:contain;
+                    border:2px solid #333;transition:border-color 0.2s;
+                `;
+                media.onmouseover = () => media.style.borderColor = '#00d4ff';
+                media.onmouseout = () => media.style.borderColor = '#333';
+            } else {
+                media = document.createElement('img');
+                media.src = url;
+                media.style.cssText = `
+                    max-width:100%;max-height:42vh;border-radius:8px;object-fit:contain;
+                    cursor:pointer;border:2px solid #333;transition:border-color 0.2s;
+                `;
+                media.onmouseover = () => media.style.borderColor = '#00d4ff';
+                media.onmouseout = () => media.style.borderColor = '#333';
+                media.onclick = () => W.open(url, '_blank');
+                media.title = 'Click to open full size';
+            }
+
+            const label = document.createElement('div');
+            label.style.cssText = 'color:#888;font-size:12px;margin-top:4px;';
+            label.textContent = `${isVidUrl ? 'Video' : 'Image'} ${i + 1}`;
+
+            const dl = document.createElement('a');
+            dl.href = url;
+            dl.download = `${isVidUrl ? 'video' : 'image'}_${i + 1}.${isVidUrl ? 'mp4' : 'png'}`;
+            dl.textContent = '⬇ Download';
+            dl.style.cssText = 'display:inline-block;margin-top:4px;color:#00d4ff;font-size:11px;text-decoration:none;';
+
+            wrap.append(media, label, dl);
+            grid.appendChild(wrap);
+        });
+
+        overlay.appendChild(grid);
+        overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+        document.addEventListener('keydown', function esc(e) { if (e.key === 'Escape') { overlay.remove(); document.removeEventListener('keydown', esc); } });
+        document.body.appendChild(overlay);
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  7. Panel UI
+    // ══════════════════════════════════════════════════════════════
+    let renderTimer;
+    function scheduleRender() {
+        clearTimeout(renderTimer);
+        renderTimer = setTimeout(renderPanel, 800);
+    }
+
+    function renderPanel() {
+        if (!state.tasks.length) return;
+
+        const blockedTasks = state.tasks.filter(t => {
+            const items = t.items || t.subItems || [];
+            return items.some(i => i.invalid === true);
+        });
+
+        if (!blockedTasks.length) return;
+
+        let panel = document.getElementById('tv-panel');
+        if (panel) panel.remove();
+
+        panel = document.createElement('div');
+        panel.id = 'tv-panel';
+        panel.style.cssText = `
+            position:fixed;bottom:14px;right:14px;z-index:99999;
+            background:#1a1a2e;color:#e0e0e0;border-radius:10px;
+            box-shadow:0 6px 24px rgba(0,0,0,0.6);border:1px solid #2a2a4a;
+            font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+            font-size:13px;min-width:300px;max-height:420px;overflow:hidden;
+            display:flex;flex-direction:column;
+        `;
+
+        // Header
+        const header = document.createElement('div');
+        header.style.cssText = `
+            padding:10px 14px;background:linear-gradient(135deg,#16213e,#0f3460);
+            border-radius:10px 10px 0 0;display:flex;align-items:center;
+            justify-content:space-between;cursor:pointer;user-select:none;
+        `;
+        const title = document.createElement('span');
+        title.style.cssText = 'font-weight:600;color:#00d4ff;';
+        title.textContent = '🖼️ Image Viewer';
+        const count = document.createElement('span');
+        count.style.cssText = 'color:#888;font-size:11px;';
+        count.textContent = `${blockedTasks.length} task(s)`;
+        header.append(title, count);
+        panel.appendChild(header);
+
+        // Body
+        const body = document.createElement('div');
+        body.id = 'tv-panel-body';
+        body.style.cssText = `padding:8px;overflow-y:auto;max-height:350px;display:${state.panelOpen ? 'block' : 'none'};`;
+
+        header.onclick = () => {
+            state.panelOpen = !state.panelOpen;
+            body.style.display = state.panelOpen ? 'block' : 'none';
+        };
+
+        // Status
+        const hasOriginHeaders = !!state.headersByPath[ORIGIN_LIST_PATH];
+        const hasAnyHeaders = !!state.capturedHeaders;
+        const status = document.createElement('div');
+        status.style.cssText = `
+            padding:4px 8px;margin-bottom:6px;border-radius:4px;font-size:11px;
+            background:${hasOriginHeaders ? '#0a3d0a' : hasAnyHeaders ? '#3d2d0a' : '#3d0a0a'};
+            color:${hasOriginHeaders ? '#4eff4e' : hasAnyHeaders ? '#ffe44e' : '#ff4e4e'};
+        `;
+        status.textContent = hasOriginHeaders
+            ? '● Ready — origin headers captured'
+            : hasAnyHeaders
+                ? '◐ Partial — click a visible image to capture signing headers'
+                : '○ Click any visible image first to capture headers';
+        body.appendChild(status);
+
+        // Task cards
+        for (const task of blockedTasks) {
+            const items = task.items || task.subItems || [];
+            const invalidCount = items.filter(i => i.invalid).length;
+            const allInvalid = invalidCount === items.length;
+            const imageIds = items.map(i => i.imageId || i.workId || i.id).filter(Boolean);
+            const taskId = task.taskId || task.id || '?';
+
+            const taskType = detectTaskType(task);
+            const isVideo = taskType === 'video';
+
+            const card = document.createElement('div');
+            card.style.cssText = `
+                margin:6px 0;padding:8px 10px;background:#222244;
+                border-radius:6px;border-left:3px solid ${allInvalid ? '#ff4e4e' : '#ffaa00'};
+            `;
+
+            const lbl = document.createElement('div');
+            lbl.style.cssText = 'color:#999;font-size:11px;margin-bottom:2px;';
+            lbl.textContent = `${isVideo ? '🎬' : '🖼️'} Task ${taskId.substring(0, 12)}…`;
+
+            const cnt = document.createElement('div');
+            cnt.style.cssText = `color:${allInvalid ? '#ff6b6b' : '#ffcc00'};font-size:12px;margin-bottom:6px;`;
+            cnt.textContent = allInvalid ? `🚫 All ${items.length} blocked` : `⚠️ ${invalidCount}/${items.length} blocked`;
+
+            const btn = document.createElement('button');
+            btn.textContent = `🔓 View All ${items.length} ${isVideo ? 'Videos' : 'Images'}`;
+            btn.style.cssText = `
+                width:100%;padding:6px 0;border:none;border-radius:5px;
+                background:linear-gradient(135deg,${isVideo ? '#b800d8,#7600b6' : '#00b4d8,#0077b6'});color:#fff;
+                font-size:12px;font-weight:600;cursor:pointer;transition:opacity 0.2s;
+            `;
+            btn.onmouseover = () => btn.style.opacity = '0.85';
+            btn.onmouseout = () => btn.style.opacity = '1';
+
+            // Use closure to capture imageIds and type properly
+            ((ids, type) => {
+                btn.onclick = () => viewImages(ids, btn, type);
+            })(imageIds, taskType);
+
+            card.append(lbl, cnt, btn);
+            body.appendChild(card);
+        }
+
+        const tip = document.createElement('div');
+        tip.style.cssText = 'color:#555;font-size:10px;padding:6px 4px 2px;text-align:center;';
+        tip.textContent = 'If fetch fails, click a visible image first, then retry.';
+        body.appendChild(tip);
+
+        panel.appendChild(body);
+        document.body.appendChild(panel);
+        console.log('[TensorViewer v2] ✓ Panel rendered with', blockedTasks.length, 'blocked tasks');
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  8. Auto-refresh on DOM changes + periodic check
+    // ══════════════════════════════════════════════════════════════
+    function startObserver() {
+        const obs = new MutationObserver(() => {
+            if (state.tasks.length && !document.getElementById('tv-panel')) {
+                scheduleRender();
+            }
+        });
+        obs.observe(document.body, { childList: true, subtree: true });
+
+        // Also periodically ensure the panel is present (catches SPA nav edge cases)
+        setInterval(() => {
+            if (state.tasks.length && !document.getElementById('tv-panel')) {
+                console.log('[TensorViewer v2] Panel missing, re-rendering...');
+                renderPanel();
+            }
+        }, 3000);
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', startObserver);
+    } else {
+        startObserver();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  9. Console API
+    // ══════════════════════════════════════════════════════════════
+    W.TensorViewer = {
+        view: (ids, type) => viewImages(ids, { textContent: '', disabled: false, set textContent(v) { }, set disabled(v) { } }, type),
+        state: () => state,
+        refresh: () => renderPanel(),
+    };
+
+    console.log('[TensorViewer v2] ✓ Ready. Console: TensorViewer.view(["id1","id2",...])');
+})();
