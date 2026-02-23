@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Tensor.Art - NSFW Bypass (via TensorHub)
 // @namespace    tensor-nsfw-bypass
-// @version      3.1
+// @version      3.2
 // @description  Routes generation requests through tensorhub.art API, bypassing NSFW prompt filter while using tensor.art credits
 // @author       You
 // @match        https://tensor.art/*
@@ -58,7 +58,9 @@
         }
 
         // ── Redirect generation request to tensorhub ──
-        if (url.includes('/works/v1/works/task') && !url.includes('tasks/') &&
+        // EXACT match: only /works/v1/works/task (end of path)
+        // NOT /task/calculate_credits, NOT /tasks/query, etc.
+        if (/\/works\/v1\/works\/task(\?|$)/.test(url) &&
             init?.method?.toUpperCase() === 'POST') {
             let bodyObj;
             try { bodyObj = JSON.parse(init.body); } catch (e) { return _realFetch(input, init); }
