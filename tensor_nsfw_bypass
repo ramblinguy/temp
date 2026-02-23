@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Tensor.Art - NSFW Bypass (via TensorHub)
 // @namespace    tensor-nsfw-bypass
-// @version      3.0
+// @version      3.1
 // @description  Routes generation requests through tensorhub.art API, bypassing NSFW prompt filter while using tensor.art credits
 // @author       You
 // @match        https://tensor.art/*
@@ -35,14 +35,26 @@
         // Only intercept when bypass is enabled
         if (!bypassEnabled) return _realFetch(input, init);
 
-        // ── Bypass sensitive word check ──
+        // ── Bypass sensitive word check: pass through but patch the result ──
         if (url.includes('/sensitive/words/check')) {
-            console.log('[NSFW-Bypass] ✓ Bypassed sensitive word check');
-            return Promise.resolve(new Response(JSON.stringify({
-                code: '0000',
-                data: { hasSensitiveWord: false, sensitiveWords: [] },
-                message: ''
-            }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+            return _realFetch(input, init).then(async (response) => {
+                try {
+                    const data = await response.clone().json();
+                    // Patch only the sensitive word fields, keep everything else
+                    if (data.data) {
+                        data.data.hasSensitiveWord = false;
+                        data.data.sensitiveWords = [];
+                    }
+                    console.log('[NSFW-Bypass] ✓ Patched sensitive check → clean');
+                    return new Response(JSON.stringify(data), {
+                        status: response.status,
+                        statusText: response.statusText,
+                        headers: { 'Content-Type': 'application/json' }
+                    });
+                } catch (e) {
+                    return response; // if parsing fails, return original
+                }
+            });
         }
 
         // ── Redirect generation request to tensorhub ──
