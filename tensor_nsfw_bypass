@@ -51,21 +51,43 @@
     //  Intercept fetch
     // ══════════════════════════════════════════════════════════════
 
-    // Track user interaction — only fake the sensitive check after recent user action
-    let lastUserAction = 0;
-    const INTERACTION_WINDOW = 5000; // 5 seconds
-    function onUserAction() { lastUserAction = Date.now(); }
+    // Only fake the sensitive check within a short window after clicking Generate
+    let generateClicked = 0;
+    const GENERATE_WINDOW = 3000; // 3 seconds
 
-    // Attach listeners once DOM is ready
-    function attachInteractionListeners() {
-        document.addEventListener('click', onUserAction, true);
-        document.addEventListener('keydown', onUserAction, true);
-        document.addEventListener('pointerdown', onUserAction, true);
+    // Find and attach listener to the Generate button specifically
+    function hookGenerateButton() {
+        // Already hooked?
+        if (document.querySelector('[data-nsfw-hooked]')) return;
+
+        // Look for buttons containing "Generate" text
+        const buttons = document.querySelectorAll('button');
+        for (const btn of buttons) {
+            const text = btn.textContent?.trim();
+            if (text && /^Generate$/i.test(text)) {
+                btn.setAttribute('data-nsfw-hooked', '1');
+                btn.addEventListener('click', () => {
+                    generateClicked = Date.now();
+                    console.log('[NSFW-Bypass] Generate button clicked — bypass armed for 3s');
+                }, true); // capture phase, fires before tensor.art's handler
+                console.log('[NSFW-Bypass] ✓ Hooked Generate button');
+                return;
+            }
+        }
     }
+
+    // Keep trying to hook (SPA navigation may recreate the button)
+    function startButtonHook() {
+        hookGenerateButton();
+        const observer = new MutationObserver(() => hookGenerateButton());
+        observer.observe(document.body, { childList: true, subtree: true });
+        setInterval(hookGenerateButton, 3000);
+    }
+
     if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', attachInteractionListeners);
+        document.addEventListener('DOMContentLoaded', startButtonHook);
     } else {
-        attachInteractionListeners();
+        startButtonHook();
     }
 
     W.fetch = function (input, init) {
@@ -86,9 +108,9 @@
 
         // ── Bypass: fake the sensitive word check ONLY if user recently interacted ──
         if (url.includes(SENSITIVE_CHECK)) {
-            const recentAction = (Date.now() - lastUserAction) < INTERACTION_WINDOW;
-            if (recentAction) {
-                console.log('[NSFW-Bypass] ✓ Bypassed sensitive word check (user-initiated)');
+            const recentGenerate = (Date.now() - generateClicked) < GENERATE_WINDOW;
+            if (recentGenerate) {
+                console.log('[NSFW-Bypass] ✓ Bypassed sensitive word check (Generate clicked)');
                 return Promise.resolve(new Response(JSON.stringify({
                     code: '0000',
                     data: { hasSensitiveWord: false, sensitiveWords: [] },
